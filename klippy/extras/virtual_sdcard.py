@@ -1,6 +1,7 @@
-# Virtual sdcard support (print files directly from a host g-code file)
+# Virtual sdcard support with parts/objects capabilities (print files directly from a host g-code file)
 #
 # Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
+# Parts handling : Copyright (C) 2021  Massimo Croci <photocromax@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, logging
@@ -23,6 +24,14 @@ class VirtualSD:
         self.must_pause_work = self.cmd_from_sd = False
         self.next_file_position = 0
         self.work_timer = None
+        ### parts handling block
+        # Parts handling
+        self.parts = []
+        self.parts_info = []
+        self.suppressed_parts = []
+        self.current_part = None
+        self.sort_part_names = config.getboolean("sort_part_names", False)
+        ### parts handling block end
         # Register commands
         self.gcode = printer.lookup_object('gcode')
         for cmd in ['M20', 'M21', 'M23', 'M24', 'M25', 'M26', 'M27']:
@@ -35,6 +44,14 @@ class VirtualSD:
         self.gcode.register_command(
             "SDCARD_PRINT_FILE", self.cmd_SDCARD_PRINT_FILE,
             desc=self.cmd_SDCARD_PRINT_FILE_help)
+        ### parts handling block
+        self.gcode.register_command(
+            "LIST_PARTS", self.cmd_LIST_PARTS,
+            desc=self.cmd_LIST_PARTS_help)
+        self.gcode.register_command(
+            "SUPPRESS_PART", self.cmd_SUPPRESS_PART,
+            desc=self.cmd_SUPPRESS_PART_help)
+        ### parts handling block end
     def handle_shutdown(self):
         if self.work_timer is not None:
             self.must_pause_work = True
@@ -124,6 +141,11 @@ class VirtualSD:
             self.current_file.close()
             self.current_file = None
         self.file_position = self.file_size = 0.
+        ### parts handling block
+        self.current_part = None
+        self.parts = []
+        self.suppressed_parts = []
+        ### parts handling block end
         self.print_stats.reset()
     cmd_SDCARD_RESET_FILE_help = "Clears a loaded SD File. Stops the print "\
         "if necessary"
@@ -143,6 +165,67 @@ class VirtualSD:
             filename = filename[1:]
         self._load_file(gcmd, filename, check_subdirs=True)
         self.do_resume()
+    ### parts handling block
+    cmd_SUPPRESS_PART_help = "Suppress printing a part. If PART is not specified,"\
+        "CURRENT printing part will be suppressed."
+    def cmd_SUPPRESS_PART(self, gcmd):
+        if self.current_file is not None :
+           part = None;
+           try:
+               part = gcmd.get("PART")
+           except:
+               if self.current_part is not None:
+                 part = self.current_part
+                 gcmd.respond_raw("// Part not specified. Adding current part"\
+                      " P%d : \"%s\" to suppression list..." % (self.parts.index(part)+1, part))
+               else:
+                 gcmd.respond_raw("// Not printing a part right now.")
+           if part is not None :
+               # P<index> has the priority in case of a file named P<index> (eg: P1,P2...Pn)
+               if part.upper().startswith("P") and part[1:].isdigit() :
+                   p = int(part[1:]) - 1
+                   if p >= 0 and p < len(self.parts) :
+                       part = self.parts[p]
+               if part in self.parts :
+                   if part not in self.suppressed_parts:
+                       self.suppressed_parts.append(part)
+                       gcmd.respond_raw("// Part P%d : \"%s\" added to suppression list"   % (self.parts.index(part)+1, part))
+                   else:
+                       gcmd.respond_raw("// Part P%d : \"%s\" ALREADY in suppression list" % (self.parts.index(part)+1, part))
+               else:
+                   gcmd.respond_raw("?? Part \"%s\" not found" % part)
+        else:
+            gcmd.respond_raw("// File not loaded.")
+    cmd_LIST_PARTS_help = "List parts name and status in a printing file."
+    def cmd_LIST_PARTS(self, gcmd):
+        import urllib,json
+        if self.current_file is not None :
+           if  len(self.parts) > 0 :
+	      link="["
+              for part in self.parts :
+                 current = ""
+                 for info in self.parts_info :
+                    if info["P"] == "P" + str(self.parts.index(part)+1) :
+			if link != "[" : link +=","
+			link += json.dumps(info) #.replace(" ","%20")
+			break
+                 if part == self.current_part :
+                    current = " : CURRENT"
+		    
+                 suppressed = ""
+                 if part in self.suppressed_parts:
+                    suppressed = " : SUPPRESSED"
+                 gcmd.respond_raw("// P%d : \"%s\"%s%s" % (self.parts.index(part)+1, part, current, suppressed))
+              link += "]"
+              #gcmd.respond_raw(link);
+              p= {'p': link }
+              link = "<a href='plate.html?" + urllib.urlencode(p).replace("+","%20") + "' target='plate'>click here for a plate view</a>"
+              gcmd.respond_raw(link);
+           else:
+              gcmd.respond_raw("// No parts detected in this file.")
+        else:
+          gcmd.respond_raw("// File not loaded.")
+    ### parts handling block end
     def cmd_M20(self, gcmd):
         # List SD card
         files = self.get_file_list()
@@ -181,6 +264,32 @@ class VirtualSD:
             f.seek(0, os.SEEK_END)
             fsize = f.tell()
             f.seek(0)
+            ### parts handling block
+            part = None
+            logging.info("Scanning File for parts...")
+            line=f.readline()
+            while line != "":   #until EOF
+                if line.startswith("; printing object ") :
+                     part = line.replace("; printing object ","").replace("\r","").replace("\n","")
+                     if part not in self.parts:
+                       self.parts.append(part)
+                elif line.startswith("; object:") :
+                     import json
+                     info = json.loads(line.replace("; object:","").replace("\r","").replace("\n",""))
+                     self.parts_info.append(info)
+                line=f.readline()
+            if self.sort_part_names :
+               self.parts.sort()
+            for part in self.parts :
+               for i in range(len(self.parts_info)) :
+                  info = self.parts_info[i]
+                  if info["id"] == part :
+		    self.parts_info[i].update({"P" : "P"+str(self.parts.index(part)+1) })
+                    logging.info("P"+ str( self.parts.index(part)+1) + " info matched")
+                    break
+            logging.info("Scan Done")
+            f.seek(0)
+            ### parts handling block end
         except:
             logging.exception("virtual_sdcard file open")
             raise gcmd.error("Unable to open file")
@@ -190,6 +299,12 @@ class VirtualSD:
         self.file_position = 0
         self.file_size = fsize
         self.print_stats.set_current_file(filename)
+        ### parts handling block
+        s="s"
+        nparts=len(self.parts)
+        if  nparts == 1: s=""
+        gcmd.respond_raw("%d Part%s detected" % (nparts,s))
+        ### parts handling block end
     def cmd_M24(self, gcmd):
         # Start/resume SD print
         self.do_resume()
@@ -260,12 +375,19 @@ class VirtualSD:
             line = lines.pop()
             next_file_position = self.file_position + len(line) + 1
             self.next_file_position = next_file_position
-            try:
+            ### parts handling block
+            if "; printing object " in line :
+                self.current_part = line.replace("; printing object ","")
+            elif "; stop printing object " + str(self.current_part) in line :
+                self.current_part = None
+            if self.current_part not in self.suppressed_parts :
+            ### parts handling block end
+              try:
                 self.gcode.run_script(line)
-            except self.gcode.error as e:
+              except self.gcode.error as e:
                 error_message = str(e)
                 break
-            except:
+              except:
                 logging.exception("virtual_sdcard dispatch")
                 break
             self.cmd_from_sd = False
